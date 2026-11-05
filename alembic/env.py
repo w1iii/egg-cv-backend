@@ -2,6 +2,7 @@ from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
+from sqlalchemy.engine import make_url
 
 from alembic import context
 
@@ -16,8 +17,25 @@ from app.models import User, Prediction, DetectionBox
 config = context.config
 
 database_url = os.getenv("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+if not database_url:
+    # No fallback to a baked-in URL: on a deploy that silently produced
+    # psycopg2 "connection refused" walls against localhost. Local runs get
+    # DATABASE_URL from `.env` (see README).
+    raise RuntimeError(
+        "DATABASE_URL is not set. Export it (local: `set -a && . ./.env && "
+        "set +a`) or set it in the deployment environment."
+    )
+
+# Alembic reads options through ConfigParser, where `%` starts interpolation.
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+
+# Log the target without leaking credentials.
+safe_url = make_url(database_url)
+print(
+    f"[alembic] database target: "
+    f"{safe_url.host or 'local-socket'}:{safe_url.port or 5432}"
+    f"/{(safe_url.database or '').lstrip('/')}"
+)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
