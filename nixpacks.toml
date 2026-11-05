@@ -1,0 +1,9 @@
+# Railway/Nixpacks build config.
+#
+# ultralytics depends on `opencv-python` (not headless), which shadows our
+# `opencv-python-headless` and loads libGL at import time. The Nixpacks image
+# ships no GL libraries, so `import cv2` fails with "libGL.so.1: cannot open
+# shared object file" and uvicorn never starts. Installing them here is
+# cheaper and more predictable than post-install dependency surgery.
+[phases.setup]
+aptPkgs = ["libgl1", "libglib2.0-0"]

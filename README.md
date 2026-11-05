@@ -43,3 +43,6 @@ Notes:
 - Give the service at least 2 GB RAM so torch + ultralytics fit comfortably.
 - `PROJECT_ROOT` is auto-detected; override it only if you relocate the
   checkpoints.
+- `nixpacks.toml` installs `libgl1`/`libglib2.0-0` for Railway builds.
+  `ultralytics` pulls `opencv-python`, which shadows
+  `opencv-python-headless` and needs those libraries to import.
