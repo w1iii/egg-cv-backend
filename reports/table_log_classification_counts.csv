@@ -1,0 +1,7 @@
+criterion,class,count,percent_of_500_rows
+Damage,Not Damaged,255,51.0
+Damage,Damaged,234,46.8
+Damage,Needs Review,11,2.2
+Cleanliness,Stained,218,43.6
+Cleanliness,Clean,257,51.4
+Cleanliness,Needs Review,25,5.0

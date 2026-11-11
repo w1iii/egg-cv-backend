@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import List
+from pathlib import Path
 
 from app.database import get_db
 from app.models import User, Prediction
@@ -195,8 +196,14 @@ def download_annotated(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Annotated file not found"
         )
+    annotated_path = Path(prediction.annotated_path)
+    if not annotated_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Annotated image is no longer available"
+        )
     return FileResponse(
-        prediction.annotated_path,
+        str(annotated_path),
         media_type="image/jpeg",
         filename=f"annotated_{prediction.file_name}"
     )
