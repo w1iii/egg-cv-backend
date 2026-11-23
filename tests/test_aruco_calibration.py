@@ -37,6 +37,28 @@ class ArucoCalibrationTests(unittest.TestCase):
         image[25:225, 275:475] = marker
         self.assertEqual(detect_scale(image)["reason"], "duplicate_marker")
 
+    def test_thin_quiet_zone_on_dark_surface_is_rejected(self):
+        # Regression: a white margin narrower than one marker cell on a
+        # darker surface used to be measured as the marker (230 px instead
+        # of 199 px), silently shrinking mm-per-pixel by ~13%.
+        marker = self.image()[100:300, 100:300]
+        for background in (60, 140):
+            image = np.full((500, 500), background, dtype=np.uint8)
+            image[85:315, 85:315] = 255
+            image[100:300, 100:300] = marker
+            result = detect_scale(image)
+            self.assertEqual(result["status"], "unavailable")
+            self.assertEqual(result["reason"], "marker_border_invalid")
+
+    def test_full_quiet_zone_on_dark_surface_is_measured(self):
+        marker = self.image()[100:300, 100:300]
+        image = np.full((500, 500), 60, dtype=np.uint8)
+        image[60:340, 60:340] = 255
+        image[100:300, 100:300] = marker
+        result = detect_scale(image)
+        self.assertEqual(result["status"], "available")
+        self.assertAlmostEqual(result["mm_per_pixel"], 50 / 199, places=4)
+
     def test_scale_drives_bbox_geometry(self):
         scale = detect_scale(self.image())["mm_per_pixel"]
         geometry = bbox_geometry(220, 160, scale)

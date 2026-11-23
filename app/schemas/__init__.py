@@ -2,8 +2,11 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 from typing import Optional, List
 from datetime import datetime
 
+from app.services.grading_service import COMMERCIAL_GRADES, DECISIONS, public_grade
 
-ALLOWED_GRADES = {"A", "B", "C", "N/A", "Reject"}
+
+ALLOWED_GRADES = set(COMMERCIAL_GRADES)
+ALLOWED_DECISIONS = set(DECISIONS)
 ALLOWED_DAMAGE = {"Damaged", "Not Damaged", "Needs Review"}
 ALLOWED_CLEANLINESS = {
     "Clean",
@@ -48,8 +51,12 @@ class DetectionBoxResponse(BaseModel):
     x2: int
     y2: int
     annotated: bool
+    # External-quality decision (Acceptable / Reject / Needs Review). NULL
+    # only for inspections recorded before decisions existed.
+    decision: Optional[str] = None
+    decision_reason: Optional[str] = None
+    # Commercial size grade, always one of A / B / C / N/A.
     grade: Optional[str] = None
-    provisional_grade: Optional[str] = None
     size: Optional[str] = None
     weight_g: Optional[float] = None
     damage_status: Optional[str] = None
@@ -78,13 +85,16 @@ class DetectionBoxResponse(BaseModel):
     requires_review: bool = False
     review_reason: Optional[str] = None
 
-    @field_validator("grade", "provisional_grade")
+    @field_validator("grade")
     @classmethod
     def validate_grade(cls, value):
-        if value == "AA":
-            return "A"
-        if value is not None and value not in ALLOWED_GRADES:
-            raise ValueError(f"Unsupported grade: {value!r}")
+        return public_grade(value)
+
+    @field_validator("decision")
+    @classmethod
+    def validate_decision(cls, value):
+        if value is not None and value not in ALLOWED_DECISIONS:
+            raise ValueError(f"Unsupported decision: {value!r}")
         return value
 
     @field_validator("damage_status")
@@ -141,27 +151,44 @@ class DetectionBoxResponse(BaseModel):
 
 
 class PredictionResponse(BaseModel):
+    """One inspection: a single uploaded or captured still image."""
+
     id: int
     file_name: str
     file_type: str
-    tray_id: str
+    inspection_code: str
     captured_at: Optional[datetime] = None
     operator: Optional[str] = None
     inference_metadata: Optional[dict] = None
     status: str
+    error_message: Optional[str] = None
     total_detections: int
+    acceptable_count: int = 0
+    reject_count: int = 0
+    needs_review_count: int
     damaged_count: int
     not_damaged_count: int
-    needs_review_count: int
-    batch_recorded: bool = False
-    batch_recorded_at: Optional[datetime] = None
-    okay_count: int = 0
-    stained_count: int = 0
-    batch_damaged_count: int = 0
-    batch_review_count: int = 0
     processing_time_ms: Optional[int]
     created_at: datetime
     completed_at: Optional[datetime]
+
+    @field_validator("error_message")
+    @classmethod
+    def sanitize_error_message(cls, value):
+        """Stored errors may hold internal detail; only allow-listed text leaves."""
+        if not value:
+            return None
+        if value.startswith("CSV export failed"):
+            return "CSV export failed"
+        from app.utils.errors import public_error_message
+
+        return public_error_message(Exception(value)) or "Prediction processing failed"
+
+    @computed_field
+    @property
+    def decision_policy_version(self) -> Optional[str]:
+        """``None`` marks a legacy inspection recorded before decisions."""
+        return (self.inference_metadata or {}).get("decision_policy_version")
 
     @field_validator("status")
     @classmethod
@@ -191,24 +218,6 @@ class PredictionDetail(PredictionResponse):
         from_attributes = True
 
 
-class BatchSummary(BaseModel):
-    okay_count: int
-    stained_count: int
-    damaged_count: int
-    review_count: int
-    total_count: int
-
-
-class BatchRecordRequest(BaseModel):
-    okay_count: int = Field(ge=0)
-    stained_count: int = Field(ge=0)
-    damaged_count: int = Field(ge=0)
-
-
-class BatchRecordResponse(PredictionDetail):
-    batch: BatchSummary
-
-
 class PredictionCreate(BaseModel):
     confidence_threshold: float = 0.75
     save_annotated: bool = True
@@ -218,9 +227,20 @@ class DashboardStats(BaseModel):
     total_predictions: int
     total_images: int
     total_detections: int
+    acceptable_count: int = 0
+    reject_count: int = 0
+    needs_review_count: int = 0
+    # Eggs from legacy inspections that carry no decision.
+    undecided_count: int = 0
     damaged_percentage: float
     avg_processing_time_ms: float
     recent_predictions: List[PredictionResponse]
+
+
+class ModelInfo(BaseModel):
+    loaded: bool
+    file: Optional[str] = None
+    sha256: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -230,7 +250,13 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     damage_model_loaded: bool = False
     cleanliness_model_loaded: bool = False
+    # Loaded is not the same as approved: an unapproved cleanliness model
+    # can never produce a final Acceptable or Reject decision.
+    cleanliness_release_approved: bool = False
+    size_grades_approved: bool = False
+    weight_estimation_enabled: bool = False
     database_connected: bool
+    models: dict[str, ModelInfo] = Field(default_factory=dict)
 
 
 class UserSettings(BaseModel):
@@ -245,9 +271,18 @@ class UserSettingsUpdate(BaseModel):
 
 
 class GradeDistribution(BaseModel):
+    """Commercial size grades. Legacy 'Reject' grades count as N/A."""
+
     grade_a: int = 0
     grade_b: int = 0
     grade_c: int = 0
     grade_na: int = 0
-    grade_reject: int = 0
+    total: int = 0
+
+
+class DecisionDistribution(BaseModel):
+    acceptable: int = 0
+    reject: int = 0
+    needs_review: int = 0
+    undecided: int = 0
     total: int = 0

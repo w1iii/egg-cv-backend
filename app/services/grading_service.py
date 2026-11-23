@@ -1,20 +1,83 @@
-"""Deterministic per-egg grading and review policy.
+"""Deterministic per-egg quality decision and commercial size grade.
 
-The final grade requires damage, cleanliness, and size. If cleanliness is
-``Unavailable``, the final grade is ``N/A``. ``provisional_grade`` exposes the
-damage+size decision without pretending cleanliness was evaluated. Size-derived
-letter grades additionally require a calibrated camera
-(``settings.CALIBRATION_VERSION``); ``Reject`` never depends on calibration.
-The current cleanliness checkpoint is a web/stock candidate and is not
-release-approved.
+Two separate concepts are produced for every detected egg:
+
+``decision`` (external quality)
+    ``Acceptable``, ``Reject`` or ``Needs Review``. It depends only on damage,
+    cleanliness and the reliability of the inputs, never on size.
+
+``grade`` (commercial size grade)
+    ``A`` (Large), ``B`` (Medium), ``C`` (Small) or ``N/A``. A letter grade is
+    published only for an ``Acceptable`` egg measured with a valid ArUco
+    calibration *and* when size grades are release-approved
+    (``ARUCO_GRADES_APPROVED``). Everything else is ``N/A``. ``Reject`` is a
+    decision, never a grade.
+
+Policy (first matching rule wins):
+
+1. Any input-reliability problem (low detection confidence, partial or
+   overlapping egg, unusable crop, poor image) -> ``Needs Review``. A
+   classifier result on an unreliable crop is not trusted in either direction.
+2. Damage ``Damaged`` -> ``Reject``.
+3. Cleanliness ``Stained`` from a release-approved model -> ``Reject``.
+4. Damage ``Needs Review``, or cleanliness ``Needs Review``/``Unavailable``/
+   ``Unknown``, or a cleanliness model that is not release-approved ->
+   ``Needs Review``.
+5. Damage ``Not Damaged`` and approved cleanliness ``Clean`` -> ``Acceptable``.
+
+An unapproved cleanliness model can therefore never produce ``Acceptable``
+nor ``Reject`` on its own; its raw prediction is still stored and shown as
+beta information.
 """
 
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
-FINAL_GRADES = ("A", "B", "C", "N/A", "Reject")
+DECISION_ACCEPTABLE = "Acceptable"
+DECISION_REJECT = "Reject"
+DECISION_NEEDS_REVIEW = "Needs Review"
+DECISIONS = (DECISION_ACCEPTABLE, DECISION_REJECT, DECISION_NEEDS_REVIEW)
+
+GRADE_NOT_APPLICABLE = "N/A"
+COMMERCIAL_GRADES = ("A", "B", "C", GRADE_NOT_APPLICABLE)
 SIZE_GRADES = {"Large": "A", "Medium": "B", "Small": "C"}
+
+DAMAGE_STATUSES = ("Damaged", "Not Damaged", "Needs Review")
+CLEANLINESS_STATUSES = ("Clean", "Stained", "Needs Review", "Unavailable", "Unknown")
 CLEANLINESS_UNAVAILABLE = "Unavailable"
+
+# Reason codes. Prefixes separate detector, crop/image and classifier causes.
+REASON_DAMAGED = "damaged"
+REASON_STAINED = "stained"
+REASON_DETECTION_LOW_CONFIDENCE = "detection_low_confidence"
+REASON_DAMAGE_NEEDS_REVIEW = "damage_needs_review"
+REASON_DAMAGE_LOW_CONFIDENCE = "damage_low_confidence"
+REASON_CLEANLINESS_UNAPPROVED = "cleanliness_unapproved"
+REASON_CLEANLINESS_UNAVAILABLE = "cleanliness_unavailable"
+REASON_CLEANLINESS_NEEDS_REVIEW = "cleanliness_needs_review"
+REASON_CLEANLINESS_LOW_CONFIDENCE = "cleanliness_low_confidence"
+
+# Raw classifier review reasons -> public reason codes.
+_CROP_REASONS = {
+    "empty_crop": "crop_empty",
+    "invalid_crop": "crop_invalid",
+    "small_crop": "crop_too_small",
+}
+
+
+@dataclass(frozen=True)
+class QualityDecision:
+    decision: str
+    reasons: tuple[str, ...]
+
+    @property
+    def requires_review(self) -> bool:
+        return self.decision == DECISION_NEEDS_REVIEW
+
+    @property
+    def reason_text(self) -> Optional[str]:
+        return join_reasons(self.reasons)
 
 
 def normalize_size(size: Optional[str]) -> str:
@@ -27,155 +90,110 @@ def normalize_size(size: Optional[str]) -> str:
 
 
 def normalize_damage_status(status: Optional[str]) -> str:
-    if status in {"Damaged", "Not Damaged", "Needs Review"}:
+    if status in DAMAGE_STATUSES:
         return status
     return "Needs Review"
 
 
 def normalize_cleanliness_status(status: Optional[str]) -> str:
-    if status in {
-        "Clean",
-        "Stained",
-        "Needs Review",
-        "Unavailable",
-        "Unknown",
-    }:
+    if status in CLEANLINESS_STATUSES:
         return status
     return "Unknown"
 
 
-def provisional_grade(
-    damage_status: Optional[str],
-    size: Optional[str],
-    damage_confidence: Optional[float] = None,
-    damage_threshold: float = 0.75,
-    detection_confidence: Optional[float] = None,
-    detection_threshold: float = 0.75,
-    *,
-    size_calibrated: bool = True,
-) -> str:
-    """Grade from damage and size only; cleanliness is intentionally ignored."""
-    status = normalize_damage_status(damage_status)
-    if detection_confidence is not None and detection_confidence < detection_threshold:
-        return "N/A"
-    if status == "Damaged":
-        return "Reject"
-    if status != "Not Damaged":
-        return "N/A"
-    if damage_confidence is not None and damage_confidence < damage_threshold:
-        return "N/A"
-    if not size_calibrated:
-        return "N/A"
-    return SIZE_GRADES.get(normalize_size(size), "N/A")
+def classifier_reason(prefix: str, raw_reason: Optional[str]) -> Optional[str]:
+    """Translate a classifier's raw review reason into a public reason code."""
+    if not raw_reason:
+        return None
+    if raw_reason in _CROP_REASONS:
+        return _CROP_REASONS[raw_reason]
+    if raw_reason == "low_confidence":
+        return f"{prefix}_low_confidence"
+    return f"{prefix}_{raw_reason}"
 
 
-def map_to_grade(
-    damage_status: Optional[str],
-    cleanliness_status: Optional[str],
-    size: Optional[str],
-    *,
-    size_calibrated: bool = True,
-) -> str:
-    """Final grade from all three criteria."""
-    damage = normalize_damage_status(damage_status)
-    cleanliness = normalize_cleanliness_status(cleanliness_status)
-    if damage == "Damaged" or cleanliness == "Stained":
-        return "Reject"
-    if damage != "Not Damaged" or cleanliness != "Clean":
-        return "N/A"
-    if not size_calibrated:
-        return "N/A"
-    return SIZE_GRADES.get(normalize_size(size), "N/A")
-
-
-def collect_review_reasons(
-    *,
-    detection_confidence: Optional[float],
-    detection_threshold: float,
-    damage_status: Optional[str],
-    damage_confidence: Optional[float],
-    damage_threshold: float,
-    cleanliness_status: Optional[str],
-    cleanliness_confidence: Optional[float] = None,
-    cleanliness_threshold: float = 0.75,
-    size: Optional[str],
-    weight_g: Optional[float],
-    weight_calibrated: bool = False,
-    size_calibrated: bool = True,
-    damage_review_reason: Optional[str] = None,
-    tray_over_capacity: bool = False,
-) -> list[str]:
-    reasons: list[str] = []
-    if (
-        detection_confidence is not None
-        and detection_confidence < detection_threshold
-    ):
-        reasons.append("low_detection_confidence")
-    damage = normalize_damage_status(damage_status)
-    if damage == "Needs Review":
-        reasons.append("damage_needs_review")
-    elif (
-        damage == "Not Damaged"
-        and damage_confidence is not None
-        and damage_confidence < damage_threshold
-    ):
-        # Only the not-damaged confidence (1 - p) is a review signal here: a
-        # damaged call already yields Reject, so flagging it again would only
-        # inflate the review queue.
-        reasons.append("low_damage_confidence")
-
-    if damage_review_reason:
-        reasons.append(damage_review_reason)
-
-    cleanliness = normalize_cleanliness_status(cleanliness_status)
-    if cleanliness in {CLEANLINESS_UNAVAILABLE, "Unknown"}:
-        reasons.append("cleanliness_unavailable")
-    elif cleanliness == "Needs Review":
-        reasons.append("cleanliness_needs_review")
-    elif (
-        cleanliness_confidence is not None
-        and cleanliness_confidence < cleanliness_threshold
-    ):
-        reasons.append("low_cleanliness_confidence")
-
-    if size_calibrated and normalize_size(size) == "Unknown":
-        reasons.append("size_unknown")
-    # Calibration is a tray-level configuration state surfaced in inference
-    # metadata and the UI, not a per-egg defect.
-    if weight_calibrated and weight_g is None:
-        reasons.append("weight_unavailable")
-    if tray_over_capacity:
-        reasons.append("tray_over_capacity")
-
-    return list(dict.fromkeys(reasons))
-
-
-def join_review_reasons(reasons: Iterable[str]) -> Optional[str]:
+def join_reasons(reasons: Iterable[Optional[str]]) -> Optional[str]:
     unique = list(dict.fromkeys(reason for reason in reasons if reason))
     return ";".join(unique) if unique else None
 
 
-def calculate_grade(
-    damage_status: Optional[str],
-    size: Optional[str],
-    detection_confidence: float,
-    detection_threshold: float,
+def split_reasons(text: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    return [part for part in text.split(";") if part]
+
+
+def calculate_quality_decision(
     *,
-    cleanliness_status: Optional[str] = "Unavailable",
-    damage_confidence: Optional[float] = None,
-    damage_threshold: float = 0.75,
-    size_calibrated: bool = True,
+    damage_status: Optional[str],
+    cleanliness_status: Optional[str],
+    cleanliness_release_approved: bool,
+    damage_reason: Optional[str] = None,
+    cleanliness_reason: Optional[str] = None,
+    input_review_reasons: Iterable[Optional[str]] = (),
+) -> QualityDecision:
+    """Return the external-quality decision and the reasons that drove it."""
+    input_reasons = [reason for reason in input_review_reasons if reason]
+    damage_detail = classifier_reason("damage", damage_reason)
+    # A crop that the damage classifier refused is an input problem too.
+    if damage_detail in _CROP_REASONS.values():
+        input_reasons.append(damage_detail)
+    if input_reasons:
+        return QualityDecision(
+            DECISION_NEEDS_REVIEW, tuple(dict.fromkeys(input_reasons))
+        )
+
+    damage = normalize_damage_status(damage_status)
+    cleanliness = normalize_cleanliness_status(cleanliness_status)
+
+    if damage == "Damaged":
+        return QualityDecision(DECISION_REJECT, (REASON_DAMAGED,))
+    if cleanliness_release_approved and cleanliness == "Stained":
+        return QualityDecision(DECISION_REJECT, (REASON_STAINED,))
+
+    reasons: list[str] = []
+    if damage == "Needs Review":
+        reasons.append(damage_detail or REASON_DAMAGE_NEEDS_REVIEW)
+
+    if not cleanliness_release_approved:
+        reasons.append(REASON_CLEANLINESS_UNAPPROVED)
+    elif cleanliness in {CLEANLINESS_UNAVAILABLE, "Unknown"}:
+        reasons.append(REASON_CLEANLINESS_UNAVAILABLE)
+    elif cleanliness == "Needs Review":
+        reasons.append(
+            classifier_reason("cleanliness", cleanliness_reason)
+            or REASON_CLEANLINESS_NEEDS_REVIEW
+        )
+
+    if reasons:
+        return QualityDecision(
+            DECISION_NEEDS_REVIEW, tuple(dict.fromkeys(reasons))
+        )
+    return QualityDecision(DECISION_ACCEPTABLE, ())
+
+
+def calculate_commercial_grade(
+    decision: str,
+    size: Optional[str],
+    *,
+    size_grades_enabled: bool,
 ) -> str:
-    """Compatibility wrapper; cleanliness defaults to unavailable, not clean."""
-    if detection_confidence < detection_threshold:
-        return "N/A"
-    if normalize_damage_status(damage_status) == "Damaged":
-        return "Reject"
-    if damage_confidence is not None and damage_confidence < damage_threshold:
-        return "N/A"
-    return map_to_grade(
-        damage_status,
-        cleanliness_status,
-        size,
-        size_calibrated=size_calibrated,
-    )
+    """Size grade A/B/C for an Acceptable egg with approved calibration."""
+    if decision != DECISION_ACCEPTABLE or not size_grades_enabled:
+        return GRADE_NOT_APPLICABLE
+    return SIZE_GRADES.get(normalize_size(size), GRADE_NOT_APPLICABLE)
+
+
+def public_grade(value: Optional[str]) -> Optional[str]:
+    """Map stored grades, including legacy values, onto the A/B/C/N/A set.
+
+    Rows written before the decision/grade split may hold ``AA`` (renamed to
+    ``A``) or ``Reject`` (now a decision, so its commercial grade is ``N/A``).
+    """
+    if value is None:
+        return None
+    if value == "AA":
+        return "A"
+    if value in COMMERCIAL_GRADES:
+        return value
+    return GRADE_NOT_APPLICABLE

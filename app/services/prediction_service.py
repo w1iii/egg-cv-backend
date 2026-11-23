@@ -1,40 +1,60 @@
-import os
+import logging
 import time
-from pathlib import Path
-from typing import Optional
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
 from uuid import uuid4
-from sqlalchemy.orm import Session
-import cv2
 
-from app.models import Prediction, DetectionBox
-from app.ml.yolo_inference import YOLOPredictor
+import cv2
+from sqlalchemy import exists
+from sqlalchemy.orm import Session
+
 from app.config import settings
-from app.services.aruco_calibration import detect_scale
 from app.ml.cleanliness_inference import CleanlinessClassifier
 from app.ml.damage_inference import DamageClassifier
+from app.ml.yolo_inference import YOLOPredictor
+from app.models import DetectionBox, Prediction
 from app.services.csv_service import append_prediction
-from app.services.grading_service import (
-    calculate_grade,
-    collect_review_reasons,
-    join_review_reasons,
-    provisional_grade,
+from app.services.inspection_pipeline import (
+    CALIBRATION_VERSION_ARUCO,
+    CALIBRATION_VERSION_NONE,
+    crop_detection,
+    inspect_image,
 )
-from app.schemas import BatchRecordRequest
+
+logger = logging.getLogger(__name__)
+
+# Bump when the decision/grade rules in grading_service change meaning.
+DECISION_POLICY_VERSION = "decision-v1"
+
+__all__ = [
+    "DECISION_POLICY_VERSION",
+    "PredictionService",
+    "crop_detection",
+    "is_within_directory",
+    "prediction_service",
+]
 
 
-def classify_batch_counts(prediction: Prediction) -> dict[str, int]:
-    counts = {"okay": 0, "stained": 0, "damaged": 0, "review": 0}
-    for box in prediction.detection_boxes:
-        if box.requires_review or box.damage_status in (None, "Needs Review"):
-            counts["review"] += 1
-        elif box.damage_status == "Damaged":
-            counts["damaged"] += 1
-        elif box.cleanliness_status == "Stained":
-            counts["stained"] += 1
-        else:
-            counts["okay"] += 1
-    return counts
+def is_within_directory(path: str | Path, directory: str | Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(directory).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _remove_upload(path: Optional[str]) -> None:
+    """Delete a stored upload, but never anything outside UPLOAD_DIR."""
+    if not path:
+        return
+    if not is_within_directory(path, settings.UPLOAD_DIR):
+        logger.warning("Refusing to delete file outside upload dir: %s", path)
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not delete upload %s", path, exc_info=True)
 
 
 class PredictionService:
@@ -62,7 +82,7 @@ class PredictionService:
             file_name=file_name,
             file_type=file_type,
             file_path=file_path,
-            tray_id=uuid4().hex,
+            inspection_code=uuid4().hex,
             captured_at=datetime.utcnow(),
             operator=operator,
             status="processing",
@@ -78,7 +98,6 @@ class PredictionService:
         prediction_id: int,
         confidence: float,
         save_annotated: bool,
-        mm_per_pixel: Optional[float] = None,
     ) -> Prediction:
         start_time = time.time()
 
@@ -90,8 +109,7 @@ class PredictionService:
         if not prediction:
             raise ValueError("Prediction not found")
 
-        img = None
-
+        annotated_path: Optional[str] = None
         try:
             if prediction.file_type != "image":
                 raise ValueError("Video prediction is not supported yet")
@@ -99,292 +117,182 @@ class PredictionService:
             img = cv2.imread(prediction.file_path)
             if img is None:
                 raise ValueError("Uploaded image could not be decoded")
-            calibration = detect_scale(img, settings.ARUCO_MARKER_ID, settings.ARUCO_SIDE_MM)
-            sizing_available = calibration["status"] == "available"
-            size_calibrated = sizing_available and settings.ARUCO_GRADES_APPROVED
-            result = self.predictor.predict_frame(
+            result = inspect_image(
                 img,
-                confidence=confidence,
-                mm_per_pixel=calibration["mm_per_pixel"] if sizing_available else 0.0,
-            )
-            result["calibration"] = calibration
-            if self.damage_classifier is None:
-                raise RuntimeError("Damage classifier is not configured")
-            damage_review_threshold = getattr(
-                self.damage_classifier,
-                "review_threshold",
-                settings.DAMAGE_REVIEW_THRESHOLD,
+                predictor=self.predictor,
+                damage_classifier=self.damage_classifier,
+                cleanliness_classifier=self.cleanliness_classifier,
+                detection_threshold=confidence,
             )
 
-            for det in result["detections"]:
-                damage_crop = crop_detection(
-                    img,
-                    det["bbox"],
-                    settings.DETECTION_CROP_PADDING,
-                    settings.MIN_CROP_SIZE,
-                )
-                damage = self.damage_classifier.classify_crop(damage_crop)
-                det["damage_status"] = damage.status
-                det["damage_confidence"] = damage.confidence
-                det["damage_model_version"] = damage.model_version
-                if self.cleanliness_classifier is None:
-                    cleanliness_status = "Unavailable"
-                    cleanliness_confidence = None
-                    cleanliness_model_version = None
-                else:
-                    cleanliness_crop = crop_detection(
-                        img,
-                        det["bbox"],
-                        settings.CLEANLINESS_CROP_PADDING,
-                        settings.MIN_CROP_SIZE,
-                    )
-                    cleanliness = self.cleanliness_classifier.classify_crop(
-                        cleanliness_crop
-                    )
-                    cleanliness_status = cleanliness.status
-                    cleanliness_confidence = cleanliness.confidence
-                    cleanliness_model_version = cleanliness.model_version
-
-                det["cleanliness_status"] = cleanliness_status
-                det["cleanliness_confidence"] = cleanliness_confidence
-                det["cleanliness_model_version"] = cleanliness_model_version
-                if not sizing_available:
-                    # Geometry in millimetres is meaningless until the camera
-                    # is calibrated; drop it rather than publishing numbers.
-                    det["size"] = "Unknown"
-                    det["length_mm"] = None
-                    det["breadth_mm"] = None
-                    det["weight_g"] = None
-                det["weight_g"] = None
-                det["calibration_version"] = "aruco-static-v1" if sizing_available else "uncalibrated"
-                det["requires_review"] = False
-                det["grade"] = calculate_grade(
-                    damage.status,
-                    det.get("size"),
-                    det["confidence"],
-                    confidence,
-                    cleanliness_status=cleanliness_status,
-                    damage_confidence=damage.confidence,
-                    damage_threshold=damage_review_threshold,
-                    size_calibrated=size_calibrated,
-                )
-                det["provisional_grade"] = provisional_grade(
-                    damage.status,
-                    det.get("size"),
-                    damage_confidence=damage.confidence,
-                    damage_threshold=damage_review_threshold,
-                    detection_confidence=det["confidence"],
-                    detection_threshold=confidence,
-                    size_calibrated=size_calibrated,
-                )
-                reasons = collect_review_reasons(
-                    detection_confidence=det["confidence"],
-                    detection_threshold=confidence,
-                    damage_status=damage.status,
-                    damage_confidence=damage.confidence,
-                    damage_threshold=damage_review_threshold,
-                    cleanliness_status=cleanliness_status,
-                    cleanliness_confidence=cleanliness_confidence,
-                    size=det.get("size"),
-                    weight_g=det.get("weight_g"),
-                    weight_calibrated=False,
-                    size_calibrated=size_calibrated,
-                    damage_review_reason=damage.review_reason,
-                    tray_over_capacity=result.get("over_capacity", False),
-                )
-                det["requires_review"] = bool(reasons)
-                det["review_reason"] = join_review_reasons(reasons)
-
-            annotated_path = None
             if save_annotated and result["detections"]:
                 annotated = self.predictor.draw_boxes(img, result["detections"])
-                base_name = Path(prediction.file_path).stem
-                ext = Path(prediction.file_path).suffix
-                annotated_path = str(
-                    Path(prediction.file_path).parent
-                    / f"annotated_{base_name}{ext}"
-                )
-                if not cv2.imwrite(annotated_path, annotated):
-                    annotated_path = None
+                source = Path(prediction.file_path)
+                candidate = str(source.parent / f"annotated_{source.stem}{source.suffix}")
+                if cv2.imwrite(candidate, annotated):
+                    annotated_path = candidate
+                else:
+                    result["annotation_error"] = "annotated_image_write_failed"
 
-            prediction.inference_metadata = self._inference_metadata(
-                confidence, result
-            )
-
+            summary = result["summary"]
+            prediction.inference_metadata = self._inference_metadata(confidence, result)
             for det in result["detections"]:
-                box = DetectionBox(
-                    prediction_id=prediction.id,
-                    egg_id=det.get("egg_id"),
-                    class_name=det["class"],
-                    confidence=det["confidence"],
-                    x1=det["bbox"][0],
-                    y1=det["bbox"][1],
-                    x2=det["bbox"][2],
-                    y2=det["bbox"][3],
-                    annotated=annotated_path is not None,
-                    size=det.get("size"),
-                    length_mm=det.get("length_mm"),
-                    breadth_mm=det.get("breadth_mm"),
-                    geometry_quality=det.get("geometry_quality"),
-                    weight_g=det.get("weight_g"),
-                    grade=det.get("grade"),
-                    provisional_grade=det.get("provisional_grade"),
-                    requires_review=bool(det.get("requires_review")),
-                    review_reason=det.get("review_reason"),
-                    damage_status=det.get("damage_status"),
-                    damage_confidence=det.get("damage_confidence"),
-                    damage_model_version=det.get("damage_model_version"),
-                    cleanliness_status=det.get("cleanliness_status"),
-                    cleanliness_confidence=det.get("cleanliness_confidence"),
-                    cleanliness_model_version=det.get(
-                        "cleanliness_model_version"
-                    ),
-                    detection_model_version=det.get(
-                        "detection_model_version"
-                    ),
-                    calibration_version=det.get("calibration_version"),
-                )
-                db.add(box)
+                db.add(self._detection_box(prediction.id, det, annotated_path))
 
             prediction.status = "completed"
+            prediction.error_message = None
             prediction.result_json = result
             prediction.annotated_path = annotated_path
-            prediction.total_detections = result["total"]
-            prediction.damaged_count = sum(
-                det.get("damage_status") == "Damaged"
-                for det in result["detections"]
-            )
-            prediction.not_damaged_count = sum(
-                det.get("damage_status") == "Not Damaged"
-                for det in result["detections"]
-            )
-            prediction.needs_review_count = sum(
-                bool(det.get("requires_review"))
-                for det in result["detections"]
-            )
+            prediction.total_detections = summary["total"]
+            prediction.acceptable_count = summary["acceptable"]
+            prediction.reject_count = summary["reject"]
+            prediction.needs_review_count = summary["needs_review"]
+            prediction.damaged_count = summary["damaged"]
+            prediction.not_damaged_count = summary["not_damaged"]
             prediction.processing_time_ms = int((time.time() - start_time) * 1000)
             prediction.completed_at = datetime.utcnow()
-
+            # Boxes, counts and status land in one transaction.
             db.commit()
             db.refresh(prediction)
-
-            try:
-                append_prediction(prediction)
-            except Exception as exc:
-                prediction.error_message = f"CSV export failed: {exc}"
+        except Exception as exc:
+            # A failed commit leaves the session unusable until rolled back;
+            # drop partial boxes and any annotated file, then mark failure.
+            db.rollback()
+            _remove_upload(annotated_path)
+            failed = db.query(Prediction).filter(Prediction.id == prediction_id).first()
+            if failed is not None:
+                failed.status = "failed"
+                failed.error_message = str(exc)[:1000]
+                failed.annotated_path = None
                 db.commit()
-
-        except Exception as e:
-            prediction.status = "failed"
-            prediction.error_message = str(e)
-            db.commit()
             raise
+
+        # The CSV is a secondary export; its failure must not undo the
+        # committed inspection, but it is recorded on the row.
+        try:
+            append_prediction(prediction)
+        except Exception as exc:
+            logger.warning("CSV export failed for prediction %s", prediction.id, exc_info=True)
+            prediction.error_message = f"CSV export failed: {exc}"[:1000]
+            db.commit()
 
         return prediction
 
+    @staticmethod
+    def _detection_box(
+        prediction_id: int, det: dict[str, Any], annotated_path: Optional[str]
+    ) -> DetectionBox:
+        return DetectionBox(
+            prediction_id=prediction_id,
+            egg_id=det.get("egg_id"),
+            class_name=det["class"],
+            confidence=det["confidence"],
+            x1=det["bbox"][0],
+            y1=det["bbox"][1],
+            x2=det["bbox"][2],
+            y2=det["bbox"][3],
+            annotated=annotated_path is not None,
+            size=det.get("size"),
+            length_mm=det.get("length_mm"),
+            breadth_mm=det.get("breadth_mm"),
+            geometry_quality=det.get("geometry_quality"),
+            weight_g=det.get("weight_g"),
+            decision=det.get("decision"),
+            decision_reason=det.get("decision_reason"),
+            grade=det.get("grade"),
+            requires_review=bool(det.get("requires_review")),
+            review_reason=det.get("review_reason"),
+            damage_status=det.get("damage_status"),
+            damage_confidence=det.get("damage_confidence"),
+            damage_model_version=det.get("damage_model_version"),
+            cleanliness_status=det.get("cleanliness_status"),
+            cleanliness_confidence=det.get("cleanliness_confidence"),
+            cleanliness_model_version=det.get("cleanliness_model_version"),
+            detection_model_version=det.get("detection_model_version"),
+            calibration_version=det.get("calibration_version"),
+        )
+
     def _inference_metadata(self, confidence: float, result: dict) -> dict:
         damage_threshold = getattr(
-            self.damage_classifier,
-            "damaged_threshold",
-            settings.DAMAGE_DECISION_THRESHOLD,
+            self.damage_classifier, "damaged_threshold", settings.DAMAGE_DECISION_THRESHOLD
         )
         damage_review = getattr(
-            self.damage_classifier,
-            "review_threshold",
-            settings.DAMAGE_REVIEW_THRESHOLD,
+            self.damage_classifier, "review_threshold", settings.DAMAGE_REVIEW_THRESHOLD
         )
-        if self.cleanliness_classifier is None:
-            cleanliness_threshold = None
-            cleanliness_review = None
-            cleanliness_model_version = None
-        else:
-            cleanliness_threshold = getattr(
-                self.cleanliness_classifier,
-                "stained_threshold",
-                settings.CLEANLINESS_DECISION_THRESHOLD,
-            )
-            cleanliness_review = getattr(
-                self.cleanliness_classifier,
-                "review_threshold",
-                settings.CLEANLINESS_REVIEW_THRESHOLD,
-            )
-            cleanliness_model_version = getattr(
-                self.cleanliness_classifier, "model_version", None
-            )
+        cleanliness = self.cleanliness_classifier
+        sizing_available = result["calibration"]["status"] == "available"
         return {
-            "detector_model_version": getattr(
-                self.predictor, "model_version", None
+            "decision_policy_version": DECISION_POLICY_VERSION,
+            "detector_model_version": getattr(self.predictor, "model_version", None),
+            "detector_sha256": getattr(self.predictor, "checkpoint_sha256", None),
+            "damage_model_version": getattr(self.damage_classifier, "model_version", None),
+            "damage_sha256": getattr(self.damage_classifier, "checkpoint_sha256", None),
+            "cleanliness_model_available": cleanliness is not None,
+            "cleanliness_model_version": getattr(cleanliness, "model_version", None),
+            "cleanliness_sha256": getattr(cleanliness, "checkpoint_sha256", None),
+            "cleanliness_release_approved": result["cleanliness_release_approved"],
+            "calibration_version": (
+                CALIBRATION_VERSION_ARUCO if sizing_available else CALIBRATION_VERSION_NONE
             ),
-            "damage_model_version": getattr(
-                self.damage_classifier, "model_version", None
-            ),
-            "cleanliness_model_version": cleanliness_model_version,
-            "calibration_version": "aruco-static-v1" if result["calibration"]["status"] == "available" else "uncalibrated",
             "calibration": result["calibration"],
-            "size_calibrated": result["calibration"]["status"] == "available" and settings.ARUCO_GRADES_APPROVED,
+            "sizing_available": sizing_available,
+            "size_calibrated": result["size_grades_enabled"],
+            "size_grades_approved": settings.ARUCO_GRADES_APPROVED,
             "weight_calibrated": False,
-            "cleanliness_release_approved": (
-                settings.CLEANLINESS_RELEASE_APPROVED
-            ),
             "detection_threshold": confidence,
             "damage_decision_threshold": damage_threshold,
             "damage_review_threshold": damage_review,
-            "cleanliness_decision_threshold": cleanliness_threshold,
-            "cleanliness_review_threshold": cleanliness_review,
+            "cleanliness_decision_threshold": (
+                None
+                if cleanliness is None
+                else getattr(cleanliness, "stained_threshold", settings.CLEANLINESS_DECISION_THRESHOLD)
+            ),
+            "cleanliness_review_threshold": (
+                None
+                if cleanliness is None
+                else getattr(cleanliness, "review_threshold", settings.CLEANLINESS_REVIEW_THRESHOLD)
+            ),
             "crop_padding": settings.DETECTION_CROP_PADDING,
             "cleanliness_crop_padding": settings.CLEANLINESS_CROP_PADDING,
-            "max_tray_eggs": result.get("max_eggs", settings.MAX_TRAY_EGGS),
-            "tray_count_valid": result.get("count_valid", True),
-            "tray_over_capacity": result.get("over_capacity", False),
-            "tray_count_status": result.get("count_status"),
-            "duplicate_boxes_removed": result.get(
-                "duplicate_boxes_removed", 0
-            ),
+            "detection_count_status": result.get("count_status"),
+            "raw_detection_count": result.get("raw_detection_count", 0),
+            "duplicate_boxes_removed": result.get("duplicate_boxes_removed", 0),
+            "invalid_boxes_removed": result.get("invalid_boxes_removed", 0),
+            "image_quality": result.get("image_quality"),
+            "review_reason_counts": result["summary"]["review_reason_counts"],
+            "annotation_error": result.get("annotation_error"),
         }
 
     def get_predictions(
-        self, db: Session, user_id: int, skip: int = 0, limit: int = 20
+        self,
+        db: Session,
+        user_id: int,
+        skip: int = 0,
+        limit: int = 20,
+        decision: Optional[str] = None,
+        review_reason: Optional[str] = None,
     ) -> list[Prediction]:
+        query = db.query(Prediction).filter(Prediction.user_id == user_id)
+        if decision is not None:
+            query = query.filter(
+                exists().where(
+                    DetectionBox.prediction_id == Prediction.id,
+                    DetectionBox.decision == decision,
+                )
+            )
+        if review_reason:
+            query = query.filter(
+                exists().where(
+                    DetectionBox.prediction_id == Prediction.id,
+                    DetectionBox.decision_reason.contains(review_reason),
+                )
+            )
         return (
-            db.query(Prediction)
-            .filter(Prediction.user_id == user_id, Prediction.batch_recorded.is_(True))
-            .order_by(Prediction.created_at.desc())
+            query.order_by(Prediction.created_at.desc())
             .offset(skip)
             .limit(limit)
             .all()
         )
-
-    def record_batch(
-        self,
-        db: Session,
-        prediction_id: int,
-        user_id: int,
-        batch: BatchRecordRequest,
-    ) -> Prediction:
-        prediction = (
-            db.query(Prediction)
-            .filter(
-                Prediction.id == prediction_id,
-                Prediction.user_id == user_id,
-            )
-            .first()
-        )
-        if not prediction:
-            raise LookupError("Prediction not found")
-        if prediction.status != "completed":
-            raise ValueError("Only completed predictions can be recorded")
-        if prediction.batch_recorded:
-            return prediction
-
-        prediction.batch_recorded = True
-        prediction.batch_recorded_at = datetime.utcnow()
-        prediction.okay_count = batch.okay_count
-        prediction.stained_count = batch.stained_count
-        prediction.batch_damaged_count = batch.damaged_count
-        prediction.batch_review_count = 0
-        db.commit()
-        db.refresh(prediction)
-        return prediction
 
     def get_prediction_detail(
         self, db: Session, prediction_id: int, user_id: int
@@ -401,45 +309,19 @@ class PredictionService:
     def delete_prediction(
         self, db: Session, prediction_id: int, user_id: int
     ) -> bool:
+        """Delete the inspection row, its eggs, the upload and annotation.
+
+        The CSV export is an append-only audit log and is not rewritten.
+        """
         prediction = self.get_prediction_detail(db, prediction_id, user_id)
         if not prediction:
             return False
-
-        try:
-            if os.path.exists(prediction.file_path):
-                os.remove(prediction.file_path)
-            if prediction.annotated_path and os.path.exists(
-                prediction.annotated_path
-            ):
-                os.remove(prediction.annotated_path)
-        except Exception:
-            pass
-
+        paths = [prediction.file_path, prediction.annotated_path]
         db.delete(prediction)
         db.commit()
+        for path in paths:
+            _remove_upload(path)
         return True
 
 
 prediction_service = PredictionService()
-
-
-def crop_detection(
-    image,
-    bbox: list[int],
-    padding_ratio: float,
-    min_crop_size: int,
-):
-    height, width = image.shape[:2]
-    x1, y1, x2, y2 = bbox
-    box_width, box_height = x2 - x1, y2 - y1
-    if box_width <= 0 or box_height <= 0:
-        return image[0:0, 0:0]
-    pad_x = int(round(box_width * padding_ratio))
-    pad_y = int(round(box_height * padding_ratio))
-    left = max(0, x1 - pad_x)
-    top = max(0, y1 - pad_y)
-    right = min(width, x2 + pad_x)
-    bottom = min(height, y2 + pad_y)
-    if right - left < min_crop_size or bottom - top < min_crop_size:
-        return image[0:0, 0:0]
-    return image[top:bottom, left:right]

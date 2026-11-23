@@ -53,7 +53,10 @@ class Prediction(Base):
     file_name = Column(String(255), nullable=False)
     file_path = Column(Text, nullable=False)
     file_type = Column(String(20), nullable=False)
-    tray_id = Column(
+    # Unique per-image inspection code. Stored in the legacy ``tray_id``
+    # column so existing rows and indexes keep working without a rename.
+    inspection_code = Column(
+        "tray_id",
         String(64),
         nullable=False,
         unique=True,
@@ -68,6 +71,10 @@ class Prediction(Base):
     damaged_count = Column(Integer, nullable=False, default=0)
     not_damaged_count = Column(Integer, nullable=False, default=0)
     needs_review_count = Column(Integer, nullable=False, default=0)
+    acceptable_count = Column(Integer, nullable=False, default=0)
+    reject_count = Column(Integer, nullable=False, default=0)
+    # Legacy batch-recording columns. No longer written or exposed by the
+    # API; retained so historical rows are not destroyed.
     batch_recorded = Column(Boolean, nullable=False, default=False, index=True)
     batch_recorded_at = Column(DateTime, nullable=True)
     okay_count = Column(Integer, nullable=False, default=0)
@@ -120,6 +127,11 @@ class DetectionBox(Base):
             "confidence >= 0 AND confidence <= 1",
             name="ck_detection_boxes_confidence",
         ),
+        CheckConstraint(
+            "decision IS NULL OR "
+            "decision IN ('Acceptable', 'Reject', 'Needs Review')",
+            name="ck_detection_boxes_decision",
+        ),
     )
 
     id = Column(Integer, primary_key=True)
@@ -139,7 +151,13 @@ class DetectionBox(Base):
     breadth_mm = Column(Float, nullable=True)
     geometry_quality = Column(String(30), nullable=True)
     weight_g = Column(Float, nullable=True)
+    # External-quality decision; NULL only on rows written before it existed.
+    decision = Column(String(20), nullable=True, index=True)
+    decision_reason = Column(String(255), nullable=True)
+    # Commercial size grade: A/B/C/N/A for new rows (legacy rows may hold
+    # 'Reject' or 'AA'; the API maps them, the data is left untouched).
     grade = Column(String(10), nullable=True)
+    # Legacy damage+size grade; no longer written or exposed.
     provisional_grade = Column(String(10), nullable=True)
     requires_review = Column(Boolean, nullable=False, default=False)
     review_reason = Column(String(255), nullable=True)

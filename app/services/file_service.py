@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import UploadFile
-from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 
@@ -28,7 +27,9 @@ def validate_image_signature(header: bytes, extension: str) -> None:
     expected = IMAGE_SIGNATURES.get(extension)
     if expected is None:
         raise ValueError(f"Unsupported file type: {extension}")
-    if not header.startswith(expected):
+    if not header.startswith(expected) or (
+        extension == ".webp" and header[8:12] != b"WEBP"
+    ):
         raise ValueError(
             f"File content does not match the {extension} extension"
         )
