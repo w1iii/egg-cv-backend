@@ -12,7 +12,7 @@ _csv_lock = threading.Lock()
 
 CSV_FIELDS = [
     "timestamp",
-    "tray_id",
+    "inspection_code",
     "operator",
     "prediction_id",
     "egg_id",
@@ -32,20 +32,30 @@ CSV_FIELDS = [
     "damage_confidence",
     "cleanliness_status",
     "cleanliness_confidence",
+    "cleanliness_release_approved",
+    "decision",
+    "decision_reason",
     "grade",
-    "provisional_grade",
     "requires_review",
     "review_reason",
     "detection_threshold",
     "damage_decision_threshold",
     "cleanliness_decision_threshold",
-    "tray_count_valid",
-    "tray_over_capacity",
+    "size_calibrated",
+    "decision_policy_version",
     "detector_model_version",
     "damage_model_version",
     "cleanliness_model_version",
     "calibration_version",
 ]
+
+
+class CsvSchemaMismatch(RuntimeError):
+    pass
+
+
+def _flag(value) -> str:
+    return "true" if value else "false"
 
 
 def rows_for_prediction(prediction) -> list[dict]:
@@ -56,7 +66,7 @@ def rows_for_prediction(prediction) -> list[dict]:
         rows.append(
             {
                 "timestamp": timestamp.isoformat() if timestamp else "",
-                "tray_id": prediction.tray_id or "",
+                "inspection_code": prediction.inspection_code or "",
                 "operator": getattr(prediction, "operator", None) or "",
                 "prediction_id": prediction.id,
                 "egg_id": box.egg_id if box.egg_id is not None else "",
@@ -84,8 +94,12 @@ def rows_for_prediction(prediction) -> list[dict]:
                     if box.cleanliness_confidence is not None
                     else ""
                 ),
+                "cleanliness_release_approved": _flag(
+                    metadata.get("cleanliness_release_approved", False)
+                ),
+                "decision": box.decision or "",
+                "decision_reason": box.decision_reason or "",
                 "grade": box.grade or "N/A",
-                "provisional_grade": box.provisional_grade or "N/A",
                 "requires_review": (
                     "true" if box.requires_review else "false"
                 ),
@@ -97,13 +111,9 @@ def rows_for_prediction(prediction) -> list[dict]:
                 "cleanliness_decision_threshold": metadata.get(
                     "cleanliness_decision_threshold", ""
                 ),
-                "tray_count_valid": (
-                    "true" if metadata.get("tray_count_valid", True) else "false"
-                ),
-                "tray_over_capacity": (
-                    "true"
-                    if metadata.get("tray_over_capacity", False)
-                    else "false"
+                "size_calibrated": _flag(metadata.get("size_calibrated", False)),
+                "decision_policy_version": metadata.get(
+                    "decision_policy_version", ""
                 ),
                 "detector_model_version": box.detection_model_version or "",
                 "damage_model_version": box.damage_model_version or "",
@@ -123,6 +133,16 @@ def append_prediction(prediction, path: Optional[str] = None) -> Path:
     # Header detection and append must be atomic: handlers run in a threadpool.
     with _csv_lock:
         needs_header = not destination.is_file() or destination.stat().st_size == 0
+        if not needs_header:
+            with destination.open("r", newline="", encoding="utf-8") as existing:
+                header = next(csv.reader(existing), [])
+            if header != CSV_FIELDS:
+                # Appending new columns under an old header would silently
+                # shift every value into the wrong column.
+                raise CsvSchemaMismatch(
+                    f"{destination.name} has a different column layout; "
+                    "point EGG_CSV_PATH at a new file"
+                )
         with destination.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
             if needs_header:

@@ -8,7 +8,18 @@ import cv2
 from app.config import settings
 from src.grading import size_category as classify_egg_size
 from src.geometry import bbox_geometry
-from src.tray_count import deduplicate_boxes, tray_count_status
+from src.detection_postprocess import (
+    clip_box,
+    deduplicate_boxes,
+    detection_count_status,
+)
+
+DECISION_COLORS_BGR = {
+    "Acceptable": (94, 160, 16),
+    "Reject": (38, 38, 220),
+    "Needs Review": (11, 158, 245),
+}
+DEFAULT_BOX_COLOR_BGR = (246, 130, 59)
 
 
 class YOLOPredictor:
@@ -18,21 +29,18 @@ class YOLOPredictor:
         confidence: float = 0.75,
         mm_per_pixel: Optional[float] = None,
         weight_k: Optional[float] = None,
-        max_eggs: Optional[int] = None,
         duplicate_iou: Optional[float] = None,
     ):
         self.model_path = model_path or settings.MODEL_PATH
         self.confidence = confidence
         self.mm_per_pixel = mm_per_pixel or settings.MM_PER_PIXEL
         self.weight_k = settings.WEIGHT_K if weight_k is None else weight_k
-        self.max_eggs = settings.MAX_TRAY_EGGS if max_eggs is None else max_eggs
         self.duplicate_iou = (
             settings.DETECTION_DUPLICATE_IOU
             if duplicate_iou is None
             else duplicate_iou
         )
-        if self.max_eggs < 1:
-            raise ValueError("max_eggs must be at least 1")
+        self.checkpoint_sha256: Optional[str] = None
         if not 0 < self.duplicate_iou <= 1:
             raise ValueError("duplicate_iou must be in (0, 1]")
         self.class_names = ["egg"]
@@ -68,6 +76,9 @@ class YOLOPredictor:
             return False
         try:
             _ = self.model
+            from app.ml.preprocessing import file_sha256
+
+            self.checkpoint_sha256 = file_sha256(Path(self.model_path))
             return True
         except Exception as e:
             print(f"Error loading model: {e}")
@@ -123,19 +134,29 @@ class YOLOPredictor:
         )
         detections = []
         duplicate_boxes_removed = 0
+        invalid_boxes_removed = 0
+        raw_detection_count = 0
         boxes = result.boxes
+        orig_shape = getattr(result, "orig_shape", None)
+        height, width = (
+            (int(orig_shape[0]), int(orig_shape[1]))
+            if orig_shape is not None
+            else (None, None)
+        )
 
         if boxes is not None and len(boxes) > 0:
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
             clss = boxes.cls.cpu().numpy()
+            raw_detection_count = len(xyxy)
 
             candidates = []
             for index in range(len(xyxy)):
-                box = xyxy[index]
-                x1, y1, x2, y2 = [int(x) for x in box]
-                if x2 <= x1 or y2 <= y1:
+                clipped = clip_box(xyxy[index], width, height)
+                if clipped is None:
+                    invalid_boxes_removed += 1
                     continue
+                x1, y1, x2, y2 = clipped
                 candidates.append(
                     {
                         "bbox": [x1, y1, x2, y2],
@@ -176,34 +197,31 @@ class YOLOPredictor:
                     "geometry_quality": geometry_quality,
                     "weight_g": weight,
                     "grade": "N/A",
-                    "provisional_grade": "N/A",
                     "detection_model_version": self.model_version,
                     "calibration_version": settings.CALIBRATION_VERSION,
                 })
 
-        count = tray_count_status(len(detections), self.max_eggs)
         return {
             "detections": detections,
-            **count,
+            **detection_count_status(len(detections)),
+            "raw_detection_count": raw_detection_count,
             "duplicate_boxes_removed": duplicate_boxes_removed,
-            "damaged": 0,
-            "not_damaged": 0,
+            "invalid_boxes_removed": invalid_boxes_removed,
         }
 
     def draw_boxes(self, image: np.ndarray, detections: List[Dict]) -> np.ndarray:
         img = image.copy()
 
-        for det in detections:
+        for index, det in enumerate(detections, start=1):
             x1, y1, x2, y2 = det["bbox"]
-            color = (59, 130, 246)
-            damage = det.get("damage_status", "Unavailable")
-            cleanliness = det.get("cleanliness_status", "Unavailable")
-            label = f"D:{damage} C:{cleanliness}"
+            decision = det.get("decision")
+            color = DECISION_COLORS_BGR.get(decision, DEFAULT_BOX_COLOR_BGR)
+            label = f"#{det.get('egg_id', index)} {decision or 'Unclassified'}"
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 img,
                 label,
-                (x1, y1 - 10),
+                (x1, max(12, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 color,

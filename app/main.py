@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import json
 from pathlib import Path
@@ -64,30 +63,6 @@ class UploadGuardMiddleware:
         await self.app(scope, receive, send)
 
 
-class NosniffMiddleware:
-    """Prevent browsers from sniffing uploaded content types."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope.get("path", "").startswith(
-            "/uploads/"
-        ):
-            await self.app(scope, receive, send)
-            return
-
-        async def send_with_nosniff(message):
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers") or [])
-                headers.append((b"x-content-type-options", b"nosniff"))
-                message = {**message, "headers": headers}
-            await send(message)
-
-        await self.app(scope, receive, send_with_nosniff)
-
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model_loaded, damage_model_loaded
@@ -101,7 +76,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Warning: Could not load YOLO model: {e}")
 
-    if settings.ENVIRONMENT != "production":
+    # Schema is owned by Alembic. create_all() only creates missing tables
+    # and never adds columns, so it is opt-in for throwaway databases.
+    if settings.AUTO_CREATE_SCHEMA:
         Base.metadata.create_all(bind=engine)
     yield
 
@@ -113,20 +90,19 @@ app = FastAPI(
 )
 
 app.add_middleware(UploadGuardMiddleware)
-app.add_middleware(NosniffMiddleware)
 # CORS must be outermost so 413s from the upload guard still carry headers.
+# No cookies or credentials are used, so credentialed CORS stays off.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "PUT"],
     allow_headers=["*"],
 )
 
-# Serve uploaded files statically from the configured upload directory.
-upload_dir = Path(settings.UPLOAD_DIR)
-upload_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=upload_dir), name="uploads")
+# Uploaded images are not served statically: the only way to read one back
+# is the per-inspection annotated download endpoint.
+Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 app.include_router(predictions.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")

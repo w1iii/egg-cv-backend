@@ -1,0 +1,111 @@
+{
+  "mode": "classifier",
+  "task": "cleanliness",
+  "inputs": {
+    "manifest": "<workspace>/A-CNN-BASED-Automated-System-for-Multi-Criterion-Egg-Grading-Quality-Sizing-And-Damage-Detection/data/cleanliness_candidates/manifests/test.csv",
+    "manifest_sha256": "b093e48fc103093b2a1cdaef7915add2eac037701d1fbba5e47767c591edbe6d",
+    "rows": 91,
+    "unreadable": 9
+  },
+  "app_policy": {
+    "description": "Statuses produced by the app wrapper at the app's configured thresholds, including Needs Review.",
+    "decision_threshold": 0.6,
+    "review_threshold": 0.75,
+    "samples": 82,
+    "confusion": {
+      "Stained": {
+        "Stained": 38,
+        "Clean": 3,
+        "Needs Review": 1
+      },
+      "Clean": {
+        "Stained": 1,
+        "Clean": 39,
+        "Needs Review": 0
+      }
+    },
+    "unrecognized_predictions": 0,
+    "decided": 81,
+    "review_rate": 0.012195121951219513,
+    "accuracy_decided": 0.9506172839506173,
+    "precision": 0.9743589743589743,
+    "recall": 0.926829268292683,
+    "specificity": 0.975,
+    "f1": 0.9500000000000001,
+    "balanced_accuracy": 0.9509146341463415,
+    "positive_recall_counting_review_as_miss": 0.9047619047619048
+  },
+  "latency": {
+    "count": 82,
+    "mean_ms": 33.063887804906344,
+    "p50_ms": 32.83250000094995,
+    "p95_ms": 36.90710000228137,
+    "max_ms": 42.358800004876684
+  },
+  "reference_threshold": {
+    "description": "Raw P(positive) thresholded without a review band, to compare with the research repo's reports.",
+    "threshold": 0.04,
+    "samples": 82,
+    "confusion": {
+      "Stained": {
+        "Stained": 41,
+        "Clean": 1,
+        "Needs Review": 0
+      },
+      "Clean": {
+        "Stained": 1,
+        "Clean": 39,
+        "Needs Review": 0
+      }
+    },
+    "unrecognized_predictions": 0,
+    "decided": 82,
+    "review_rate": 0.0,
+    "accuracy_decided": 0.975609756097561,
+    "precision": 0.9761904761904762,
+    "recall": 0.9761904761904762,
+    "specificity": 0.975,
+    "f1": 0.9761904761904762,
+    "balanced_accuracy": 0.9755952380952381,
+    "positive_recall_counting_review_as_miss": 0.9761904761904762
+  },
+  "environment": {
+    "generated_at": "2026-11-23T11:06:03.974569+00:00",
+    "python": "3.12.10",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "backend_root": "<main-checkout>",
+    "code": {
+      "commit": "225d5e11e53702f5c865149d7a211def8503099e",
+      "branch": "main",
+      "dirty": false
+    },
+    "torch": "2.3.1+cpu",
+    "settings": {
+      "CONFIDENCE_THRESHOLD": 0.75,
+      "DAMAGE_DECISION_THRESHOLD": 0.65,
+      "DAMAGE_REVIEW_THRESHOLD": 0.75,
+      "CLEANLINESS_DECISION_THRESHOLD": 0.6,
+      "CLEANLINESS_REVIEW_THRESHOLD": 0.75,
+      "CLEANLINESS_RELEASE_APPROVED": false,
+      "ARUCO_GRADES_APPROVED": false,
+      "DETECTION_CROP_PADDING": 0.1,
+      "CLEANLINESS_CROP_PADDING": 0.0,
+      "DETECTION_DUPLICATE_IOU": 0.85,
+      "MAX_TRAY_EGGS": 5
+    },
+    "checkpoints": {
+      "MODEL_PATH": {
+        "file": "best.pt",
+        "sha256": "c755a7a6cf5ad883486e0396dc0dfda5030ada3007315e6ef479b26a99a931cf"
+      },
+      "DAMAGE_MODEL_PATH": {
+        "file": "egg_grader_crop_resnet18_v1.pth",
+        "sha256": "9fe5d113a5c1c5faebec17b806a09975c50f2cac3cbf67f9a06d5432b26f1861"
+      },
+      "CLEANLINESS_MODEL_PATH": {
+        "file": "egg_grader_cleanliness_v1.pth",
+        "sha256": "b00884a1f6b03b87e2f8b3378081cbadbbdab9e68218de082d3c624e3c866a6f"
+      }
+    }
+  }
+}

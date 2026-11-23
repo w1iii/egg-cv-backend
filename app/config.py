@@ -30,6 +30,12 @@ class Settings(BaseSettings):
 
     UPLOAD_DIR: str = "uploads"
     MAX_FILE_SIZE_MB: int = 50
+    # The API has no authentication (single shared local operator). A
+    # production deployment must acknowledge that explicitly.
+    ACCEPT_UNAUTHENTICATED_ACCESS: bool = False
+    # Schema changes go through Alembic. create_all() is opt-in for throwaway
+    # development databases only; it never alters existing tables.
+    AUTO_CREATE_SCHEMA: bool = False
 
     MODEL_PATH: str = str(
         PROJECT_ROOT / "egg_detection" / "finetune_egg_v1" / "weights" / "best.pt"
@@ -37,7 +43,9 @@ class Settings(BaseSettings):
     DAMAGE_MODEL_PATH: str = str(
         PROJECT_ROOT / "models" / "egg_grader_crop_resnet18_v1.pth"
     )
-    EGG_CSV_PATH: str = str(PROJECT_ROOT / "reports" / "egg_statistics_v2.csv")
+    # v3 columns carry decision/grade separately; older files keep their
+    # own header and are never appended to with the new schema.
+    EGG_CSV_PATH: str = str(PROJECT_ROOT / "reports" / "egg_statistics_v3.csv")
     CONFIDENCE_THRESHOLD: float = 0.75
     # Conservative MVP defaults; the lower validation thresholds favor recall
     # but produce too many artifact-driven false positives in web images.
@@ -58,8 +66,15 @@ class Settings(BaseSettings):
     # unlike the damage checkpoint which uses detector crops with context.
     CLEANLINESS_CROP_PADDING: float = 0.0
     MIN_CROP_SIZE: int = 8
-    MAX_TRAY_EGGS: int = 5
     DETECTION_DUPLICATE_IOU: float = 0.85
+    # Input-reliability heuristics (app/services/image_quality.py). They only
+    # route eggs to Needs Review and are not tuned on labeled data.
+    IMAGE_MIN_SIDE_PX: int = 320
+    IMAGE_MIN_SHARPNESS: float = 5.0
+    EDGE_MARGIN_PX: int = 2
+    DETECTION_OVERLAP_REVIEW: float = 0.30
+    CROP_MIN_BRIGHTNESS: float = 35.0
+    CROP_MAX_SATURATED_FRACTION: float = 0.25
     MM_PER_PIXEL: float = 0.09
     # Fitted coefficient for W = k * L * B^2; 0.0 means not yet calibrated.
     WEIGHT_K: float = 0.0
@@ -91,6 +106,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DATABASE_URL points at localhost in production; set the "
                 "deployment database URL"
+            )
+        if not self.ACCEPT_UNAUTHENTICATED_ACCESS:
+            raise ValueError(
+                "The API has no authentication. Set "
+                "ACCEPT_UNAUTHENTICATED_ACCESS=true to acknowledge that "
+                "anyone who can reach the service can upload, read and "
+                "delete inspections, or keep it on a private network."
+            )
+        if self.AUTO_CREATE_SCHEMA:
+            raise ValueError(
+                "AUTO_CREATE_SCHEMA must be false in production; run "
+                "'alembic upgrade head'"
             )
         return self
 

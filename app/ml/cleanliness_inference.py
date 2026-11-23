@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from app.config import settings
+from app.ml.preprocessing import build_eval_transform, check_crop, file_sha256, to_rgb
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,9 @@ class CleanlinessResult:
     confidence: float
     model_version: str
     review_reason: Optional[str] = None
+    # Raw positive-class probability (P(Damaged) / P(Stained)); None when
+    # the crop was refused before inference.
+    probability: Optional[float] = None
 
 
 def decide_cleanliness(
@@ -69,6 +73,7 @@ class CleanlinessClassifier:
         self.class_names = self.EXPECTED_CLASSES
         self.arch = "unknown"
         self.img_size = 224
+        self.checkpoint_sha256: Optional[str] = None
 
     @property
     def model_version(self) -> str:
@@ -94,7 +99,6 @@ class CleanlinessClassifier:
 
     def _load_model_locked(self) -> None:
         import torch
-        from torchvision import transforms
 
         from src.model_factory import build_model
 
@@ -139,23 +143,14 @@ class CleanlinessClassifier:
         model.load_state_dict(checkpoint["state_dict"])
         model.to(self._select_device(torch))
         model.eval()
-        transform = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.Resize((img_size,) * 2),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    [0.485, 0.456, 0.406],
-                    [0.229, 0.224, 0.225],
-                ),
-            ]
-        )
+        transform = build_eval_transform(img_size)
         # Publish state only once every dependency is ready so concurrent
         # callers never observe a model without its transform.
         self._torch = torch
         self.arch = arch
         self.img_size = img_size
         self._transform = transform
+        self.checkpoint_sha256 = file_sha256(self.checkpoint_path)
         self._model = model
 
     def _select_device(self, torch_module: Any):
@@ -171,31 +166,14 @@ class CleanlinessClassifier:
         return torch_module.device("cpu")
 
     def classify_crop(self, crop: np.ndarray) -> CleanlinessResult:
-        if crop is None or not isinstance(crop, np.ndarray) or crop.size == 0:
+        check = check_crop(crop)
+        if not check.ok:
             return CleanlinessResult(
-                "Needs Review", 0.0, self.model_version, "empty_crop"
-            )
-        if crop.ndim not in (2, 3) or crop.shape[0] < 2 or crop.shape[1] < 2:
-            return CleanlinessResult(
-                "Needs Review", 0.0, self.model_version, "invalid_crop"
-            )
-        # If the crop is too small relative to the model's expected input size
-        # (224×224), resizing it will heavily upsample and produce unreliable
-        # predictions. Fall back to Needs Review rather than classify an undersized
-        # crop. The minimum crop area of ~2,500 px² (~5% of model input area) ensures
-        # the crop retains meaningful visual detail after resizing.
-        MIN_CROP_AREA = 2500
-        crop_area = crop.shape[0] * crop.shape[1]
-        if crop_area < MIN_CROP_AREA:
-            return CleanlinessResult(
-                "Needs Review", 0.0, self.model_version, "small_crop"
+                "Needs Review", 0.0, self.model_version, check.reason
             )
 
         self._ensure_model()
-        if crop.ndim == 2:
-            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
-        else:
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crop = to_rgb(crop)
 
         tensor = self._transform(crop).unsqueeze(0).to(
             self._model.parameters().__next__().device
@@ -213,4 +191,5 @@ class CleanlinessClassifier:
             confidence,
             self.model_version,
             review_reason,
+            stained_probability,
         )
