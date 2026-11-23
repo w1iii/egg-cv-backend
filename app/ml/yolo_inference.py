@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Optional
 import cv2
 
 from app.config import settings
-from src.grading import estimate_weight as estimate_egg_weight
 from src.grading import size_category as classify_egg_size
 from src.geometry import bbox_geometry
 from src.tray_count import deduplicate_boxes, tray_count_status
@@ -164,11 +163,7 @@ class YOLOPredictor:
                     length_mm = round(geometry.length_mm, 2)
                     breadth_mm = round(geometry.breadth_mm, 2)
                     geometry_quality = geometry.quality
-                    weight = estimate_egg_weight(
-                        geometry.length_mm,
-                        geometry.breadth_mm,
-                        self.weight_k,
-                    )
+                    weight = None
                 class_name = self.get_class_name(candidate["class_id"])
                 detections.append({
                     "egg_id": egg_id,

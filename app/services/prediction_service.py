@@ -10,6 +10,7 @@ import cv2
 from app.models import Prediction, DetectionBox
 from app.ml.yolo_inference import YOLOPredictor
 from app.config import settings
+from app.services.aruco_calibration import detect_scale
 from app.ml.cleanliness_inference import CleanlinessClassifier
 from app.ml.damage_inference import DamageClassifier
 from app.services.csv_service import append_prediction
@@ -81,10 +82,6 @@ class PredictionService:
     ) -> Prediction:
         start_time = time.time()
 
-        # Only an explicit calibration version counts as calibrated; a manual
-        # mm_per_pixel override still needs the operator to bump the version.
-        size_calibrated = settings.CALIBRATION_VERSION != "uncalibrated"
-
         # Release the pooled DB connection before CPU inference so concurrent
         # uploads never pin pool slots for the whole prediction.
         db.close()
@@ -102,11 +99,15 @@ class PredictionService:
             img = cv2.imread(prediction.file_path)
             if img is None:
                 raise ValueError("Uploaded image could not be decoded")
-            result = self.predictor.predict_image(
-                prediction.file_path,
+            calibration = detect_scale(img, settings.ARUCO_MARKER_ID, settings.ARUCO_SIDE_MM)
+            sizing_available = calibration["status"] == "available"
+            size_calibrated = sizing_available and settings.ARUCO_GRADES_APPROVED
+            result = self.predictor.predict_frame(
+                img,
                 confidence=confidence,
-                mm_per_pixel=mm_per_pixel,
+                mm_per_pixel=calibration["mm_per_pixel"] if sizing_available else 0.0,
             )
+            result["calibration"] = calibration
             if self.damage_classifier is None:
                 raise RuntimeError("Damage classifier is not configured")
             damage_review_threshold = getattr(
@@ -147,13 +148,15 @@ class PredictionService:
                 det["cleanliness_status"] = cleanliness_status
                 det["cleanliness_confidence"] = cleanliness_confidence
                 det["cleanliness_model_version"] = cleanliness_model_version
-                if not size_calibrated:
+                if not sizing_available:
                     # Geometry in millimetres is meaningless until the camera
                     # is calibrated; drop it rather than publishing numbers.
                     det["size"] = "Unknown"
                     det["length_mm"] = None
                     det["breadth_mm"] = None
                     det["weight_g"] = None
+                det["weight_g"] = None
+                det["calibration_version"] = "aruco-static-v1" if sizing_available else "uncalibrated"
                 det["requires_review"] = False
                 det["grade"] = calculate_grade(
                     damage.status,
@@ -184,7 +187,7 @@ class PredictionService:
                     cleanliness_confidence=cleanliness_confidence,
                     size=det.get("size"),
                     weight_g=det.get("weight_g"),
-                    weight_calibrated=settings.WEIGHT_K > 0,
+                    weight_calibrated=False,
                     size_calibrated=size_calibrated,
                     damage_review_reason=damage.review_reason,
                     tray_over_capacity=result.get("over_capacity", False),
@@ -316,9 +319,10 @@ class PredictionService:
                 self.damage_classifier, "model_version", None
             ),
             "cleanliness_model_version": cleanliness_model_version,
-            "calibration_version": settings.CALIBRATION_VERSION,
-            "size_calibrated": settings.CALIBRATION_VERSION != "uncalibrated",
-            "weight_calibrated": settings.WEIGHT_K > 0,
+            "calibration_version": "aruco-static-v1" if result["calibration"]["status"] == "available" else "uncalibrated",
+            "calibration": result["calibration"],
+            "size_calibrated": result["calibration"]["status"] == "available" and settings.ARUCO_GRADES_APPROVED,
+            "weight_calibrated": False,
             "cleanliness_release_approved": (
                 settings.CLEANLINESS_RELEASE_APPROVED
             ),

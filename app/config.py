@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # Only a non-"uncalibrated" value enables size-derived grades and mm
     # metrics. Changing MM_PER_PIXEL alone does not count as calibration.
     CALIBRATION_VERSION: str = "uncalibrated"
+    ARUCO_MARKER_ID: int = 0
+    ARUCO_SIDE_MM: float = 50.0
+    # Enable only after the fixed physical setup has been validated.
+    ARUCO_GRADES_APPROVED: bool = False
 
     @property
     def cors_origins(self) -> list[str]:
