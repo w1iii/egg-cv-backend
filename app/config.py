@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     DAMAGE_DECISION_THRESHOLD: float = 0.65
     DAMAGE_REVIEW_THRESHOLD: float = 0.75
     CLEANLINESS_MODEL_PATH: str = str(
-        PROJECT_ROOT / "models" / "egg_grader_cleanliness_v1.pth"
+        PROJECT_ROOT / "models" / "cleanliness_reviewed_resnet18.pth"
     )
     # The validation-selected 0.04 threshold maximizes stained recall but
     # turns minor background artifacts into stained decisions.
