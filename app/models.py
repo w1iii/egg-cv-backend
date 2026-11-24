@@ -37,6 +37,22 @@ class User(Base):
     )
 
 
+class Batch(Base):
+    __tablename__ = "batches"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    inspections = relationship("BatchInspection", cascade="all, delete-orphan")
+
+
+class BatchInspection(Base):
+    __tablename__ = "batch_inspections"
+
+    batch_id = Column(ForeignKey("batches.id", ondelete="CASCADE"), primary_key=True)
+    prediction_id = Column(ForeignKey("predictions.id"), primary_key=True, unique=True)
+
+
 class Prediction(Base):
     __tablename__ = "predictions"
     __table_args__ = (

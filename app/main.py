@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import compat, predictions, dashboard, user_settings
+from app.routers import batches, compat, predictions, dashboard, user_settings
 from app.ml.model_registry import model_registry
 
 model_loaded = False
@@ -105,6 +105,7 @@ app.add_middleware(
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 app.include_router(predictions.router, prefix="/api/v1")
+app.include_router(batches.router, prefix="/api/v1")
 app.include_router(dashboard.router, prefix="/api/v1")
 app.include_router(user_settings.router, prefix="/api/v1")
 app.include_router(compat.router, prefix="/api/v1")

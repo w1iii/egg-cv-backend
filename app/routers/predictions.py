@@ -6,7 +6,7 @@ from pathlib import Path
 import mimetypes
 
 from app.database import get_db
-from app.models import User, Prediction
+from app.models import User, Prediction, BatchInspection
 from app.operator import get_operator
 from app.config import settings
 from app.schemas import PredictionResponse, PredictionDetail
@@ -138,6 +138,8 @@ def delete_prediction(
     db: Session = Depends(get_db),
     operator: User = Depends(get_operator)
 ):
+    if db.query(BatchInspection).filter_by(prediction_id=prediction_id).first():
+        raise HTTPException(status_code=409, detail="Cannot delete an inspection in a saved batch")
     success = prediction_service.delete_prediction(
         db, prediction_id, operator.id
     )
