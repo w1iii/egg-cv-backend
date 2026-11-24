@@ -147,6 +147,24 @@ def test_batch_record_endpoint_is_gone(client):
     assert response.status_code in (404, 405)
 
 
+def test_save_batch_groups_inspections_and_prevents_duplicate_membership(client):
+    install_models(grid_boxes(1, size=80, origin=40), clean_clf=cleanliness())
+    first = upload(client).json()
+    second = upload(client).json()
+    ids = [first["id"], second["id"]]
+    response = client.post("/api/v1/batches", json={"inspection_ids": ids})
+    assert response.status_code == 201, response.text
+    batch = response.json()
+    assert set(batch["inspection_ids"]) == set(ids)
+    assert batch["total_detections"] == 2
+    assert batch["needs_review_count"] == 2
+    assert client.get("/api/v1/batches").json()[0]["id"] == batch["id"]
+    assert client.post("/api/v1/batches", json={"inspection_ids": ids}).status_code == 409
+    assert client.post("/api/v1/batches", json={"inspection_ids": [999999]}).status_code == 404
+    assert client.delete(f"/api/v1/predictions/{ids[0]}").status_code == 409
+    assert client.get(f"/api/v1/predictions/{ids[0]}").status_code == 200
+
+
 def test_delete_removes_row_and_files(client):
     install_models(grid_boxes(1, size=80, origin=40))
     body = upload(client).json()
