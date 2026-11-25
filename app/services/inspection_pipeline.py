@@ -94,6 +94,10 @@ def inspect_image(
         det["damage_confidence"] = damage.confidence
         det["damage_probability"] = getattr(damage, "probability", None)
         det["damage_model_version"] = damage.model_version
+        # Experimental provider predictions are visible, but cannot make a
+        # final accept/reject decision until independently validated.
+        if getattr(damage_classifier, "experimental", False):
+            input_reasons.append("damage_unvalidated")
 
         if cleanliness_classifier is None:
             cleanliness_status = "Unavailable"

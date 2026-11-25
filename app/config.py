@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # but produce too many artifact-driven false positives in web images.
     DAMAGE_DECISION_THRESHOLD: float = 0.65
     DAMAGE_REVIEW_THRESHOLD: float = 0.75
+    # Hosted provider is experimental and sends egg crops to Roboflow.
+    DAMAGE_PROVIDER: str = "local"
+    ROBOFLOW_API_KEY: str = ""
+    ROBOFLOW_DAMAGE_MODEL: str = "egg_crack/2"
+    ROBOFLOW_TIMEOUT_SECONDS: float = 15.0
     CLEANLINESS_MODEL_PATH: str = str(
         PROJECT_ROOT / "models" / "cleanliness_reviewed_resnet18.pth"
     )

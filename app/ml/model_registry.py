@@ -3,6 +3,7 @@ from typing import Optional
 from app.config import settings
 from app.ml.cleanliness_inference import CleanlinessClassifier
 from app.ml.damage_inference import DamageClassifier
+from app.ml.roboflow_damage import RoboflowDamageClassifier
 from app.ml.yolo_inference import YOLOPredictor
 
 
@@ -18,10 +19,20 @@ class ModelRegistry:
     def load(self) -> tuple[bool, bool]:
         self.detector = YOLOPredictor()
         detector_loaded = self.detector.load_model()
-        self.damage = DamageClassifier(
-            damaged_threshold=settings.DAMAGE_DECISION_THRESHOLD,
-            review_threshold=settings.DAMAGE_REVIEW_THRESHOLD,
-        )
+        if settings.DAMAGE_PROVIDER == "roboflow":
+            self.damage = RoboflowDamageClassifier(
+                api_key=settings.ROBOFLOW_API_KEY,
+                model_id=settings.ROBOFLOW_DAMAGE_MODEL,
+                threshold=settings.DAMAGE_DECISION_THRESHOLD,
+                timeout=settings.ROBOFLOW_TIMEOUT_SECONDS,
+            )
+        elif settings.DAMAGE_PROVIDER == "local":
+            self.damage = DamageClassifier(
+                damaged_threshold=settings.DAMAGE_DECISION_THRESHOLD,
+                review_threshold=settings.DAMAGE_REVIEW_THRESHOLD,
+            )
+        else:
+            raise ValueError("Unknown DAMAGE_PROVIDER")
         damage_loaded = self.damage.load_model()
         self.cleanliness = CleanlinessClassifier(
             stained_threshold=settings.CLEANLINESS_DECISION_THRESHOLD,

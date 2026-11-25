@@ -84,6 +84,17 @@ def test_damaged_egg_is_rejected_and_reasons_are_separated():
     assert result["summary"]["needs_review"] == 1
 
 
+def test_experimental_damage_prediction_never_finalizes_decision():
+    clf = damage(queue=[("Damaged", 0.9, None)])
+    clf.experimental = True
+    result = run(textured(), grid_boxes(1, size=90, origin=40), damage_clf=clf,
+                 clean_clf=cleanliness(), cfg=config(CLEANLINESS_RELEASE_APPROVED=True))
+    det = result["detections"][0]
+    assert det["damage_status"] == "Damaged"
+    assert det["decision"] == "Needs Review"
+    assert "damage_unvalidated" in det["decision_reason"]
+
+
 def test_partial_and_overlapping_eggs_are_flagged_individually():
     boxes = [[0, 200, 90, 290], [300, 200, 400, 300], [330, 230, 430, 330], [600, 200, 690, 290]]
     result = run(textured(), boxes, clean_clf=cleanliness(), cfg=config(CLEANLINESS_RELEASE_APPROVED=True))
