@@ -9,6 +9,8 @@ from typing import Any, Iterable, Optional
 
 
 DEFAULT_DUPLICATE_IOU = 0.85
+DEFAULT_CONTAINMENT = 0.95
+DEFAULT_CENTER_DISTANCE = 0.25
 
 
 def box_area(box: list[int]) -> int:
@@ -61,16 +63,37 @@ def deduplicate_boxes(
     candidates: Iterable[dict[str, Any]],
     iou_threshold: float = DEFAULT_DUPLICATE_IOU,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Keep the most confident of near-identical boxes, ordered top-to-bottom."""
+    """Suppress near-identical boxes and strongly contained, centered fragments.
+
+    Containment alone is insufficient: a smaller real egg can overlap a larger
+    egg. Require centers to be close in both axes as well. Keep the larger box
+    for contained fragments so damage inference sees the whole egg. Remaining
+    ambiguous overlaps are retained for the quality-review policy.
+    """
+    def centered_containment(a: list[int], b: list[int]) -> bool:
+        if overlap_ratio(a, b) < DEFAULT_CONTAINMENT:
+            return False
+        large, small = (a, b) if box_area(a) >= box_area(b) else (b, a)
+        width, height = large[2] - large[0], large[3] - large[1]
+        return (
+            abs((small[0] + small[2]) - (large[0] + large[2])) / (2 * width)
+            <= DEFAULT_CENTER_DISTANCE
+            and abs((small[1] + small[3]) - (large[1] + large[3])) / (2 * height)
+            <= DEFAULT_CENTER_DISTANCE
+        )
+
     kept: list[dict[str, Any]] = []
     removed = 0
     for candidate in sorted(
-        candidates, key=lambda item: item["confidence"], reverse=True
+        candidates, key=lambda item: (box_area(item["bbox"]), item["confidence"]), reverse=True
     ):
-        if any(
-            box_iou(candidate["bbox"], existing["bbox"]) >= iou_threshold
-            for existing in kept
-        ):
+        duplicate = next((existing for existing in kept if
+                          box_iou(candidate["bbox"], existing["bbox"]) >= iou_threshold
+                          or centered_containment(candidate["bbox"], existing["bbox"])), None)
+        if duplicate is not None:
+            if (box_iou(candidate["bbox"], duplicate["bbox"]) >= iou_threshold
+                    and candidate["confidence"] > duplicate["confidence"]):
+                kept[kept.index(duplicate)] = candidate
             removed += 1
             continue
         kept.append(candidate)
